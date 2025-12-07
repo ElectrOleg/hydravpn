@@ -1,8 +1,5 @@
-# Dependencies
-go.sum
-
 # Binary
-hydra
+/hydra
 
 # IDE
 .idea/
@@ -20,3 +17,6 @@ logs/
 # Git
 .git/
 .gitignore
+
+# Scripts (not needed in container)
+setup-server.sh
