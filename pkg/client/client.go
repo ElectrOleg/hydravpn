@@ -113,15 +113,27 @@ func (c *Client) Connect() error {
 	log.Printf("Handshake complete, session ID: %d", c.sessionID)
 	log.Printf("Assigned VPN IP: %s, Server IP: %s", c.assignedIP, c.serverIP)
 	
+	// Extract VPN server IP (without port)
+	serverHost := c.config.ServerAddr
+	if idx := len(serverHost) - 1; idx > 0 {
+		for i := len(serverHost) - 1; i >= 0; i-- {
+			if serverHost[i] == ':' {
+				serverHost = serverHost[:i]
+				break
+			}
+		}
+	}
+
 	// Create TUN device with assigned IP
 	tunConfig := &tun.Config{
-		Name:     "hydra0",
-		MTU:      1400,
-		LocalIP:  c.assignedIP,
-		RemoteIP: c.serverIP,
+		Name:        "hydra0",
+		MTU:         1400,
+		LocalIP:     c.assignedIP,
+		RemoteIP:    c.serverIP,
+		VPNServerIP: serverHost, // For route exclusion
 	}
 	_, tunConfig.Subnet, _ = net.ParseCIDR("10.8.0.0/24")
-	
+
 	tunDev, err := tun.New(tunConfig)
 	if err != nil {
 		log.Printf("Warning: Failed to create TUN device: %v", err)
@@ -129,26 +141,34 @@ func (c *Client) Connect() error {
 	} else {
 		c.tunDevice = tunDev
 		log.Printf("Created TUN interface: %s", tunDev.Name())
-		
+
+		// Set default route to redirect all traffic through VPN
+		if err := tunDev.SetDefaultRoute(); err != nil {
+			log.Printf("Warning: Failed to set default route: %v", err)
+			log.Printf("Traffic will NOT be routed through VPN")
+		} else {
+			log.Printf("All traffic now routes through VPN")
+		}
+
 		// Start reading from TUN
 		c.wg.Add(1)
 		go c.tunReadLoop()
 	}
-	
+
 	c.connMu.Lock()
 	c.connected = true
 	c.connMu.Unlock()
-	
+
 	// Start receiving from server
 	c.wg.Add(1)
 	go c.receiveLoop()
-	
+
 	// Start keepalive
 	c.wg.Add(1)
 	go c.keepaliveLoop()
-	
+
 	log.Println("VPN tunnel established successfully!")
-	
+
 	return nil
 }
 
@@ -199,7 +219,8 @@ func (c *Client) performHandshake() error {
 	}
 	
 	// Derive session keys (client is initiator)
-	salt := make([]byte, 32) // In real implementation, exchange salt
+	// Use shared secret as salt (same as server)
+	salt := sharedSecret[:]
 	c.cryptoSession, err = crypto.DeriveSessionKeys(sharedSecret, true, salt)
 	if err != nil {
 		return fmt.Errorf("failed to derive keys: %w", err)

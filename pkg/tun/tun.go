@@ -5,27 +5,33 @@ import (
 	"net"
 	"os/exec"
 	"runtime"
+	"strings"
 
 	"github.com/songgao/water"
 )
 
 // TUNDevice represents a TUN network interface
 type TUNDevice struct {
-	iface  *water.Interface
-	name   string
-	mtu    int
+	iface    *water.Interface
+	name     string
+	mtu      int
 	localIP  net.IP
 	remoteIP net.IP
 	subnet   *net.IPNet
+
+	// For route cleanup
+	originalGateway string
+	vpnServerIP     string
 }
 
 // Config holds TUN device configuration
 type Config struct {
-	Name     string // Interface name (optional, auto-generated if empty)
-	MTU      int    // Maximum transmission unit
-	LocalIP  net.IP // Local IP address for the interface
-	RemoteIP net.IP // Remote/server IP address
-	Subnet   *net.IPNet // Subnet for the VPN network
+	Name        string     // Interface name (optional, auto-generated if empty)
+	MTU         int        // Maximum transmission unit
+	LocalIP     net.IP     // Local IP address for the interface
+	RemoteIP    net.IP     // Remote/server IP address
+	Subnet      *net.IPNet // Subnet for the VPN network
+	VPNServerIP string     // Real IP of VPN server (for route exclusion)
 }
 
 // DefaultConfig returns default TUN configuration
@@ -50,7 +56,7 @@ func New(cfg *Config) (*TUNDevice, error) {
 	config := water.Config{
 		DeviceType: water.TUN,
 	}
-	
+
 	if cfg.Name != "" && runtime.GOOS != "darwin" {
 		config.Name = cfg.Name
 	}
@@ -61,12 +67,13 @@ func New(cfg *Config) (*TUNDevice, error) {
 	}
 
 	dev := &TUNDevice{
-		iface:    iface,
-		name:     iface.Name(),
-		mtu:      cfg.MTU,
-		localIP:  cfg.LocalIP,
-		remoteIP: cfg.RemoteIP,
-		subnet:   cfg.Subnet,
+		iface:       iface,
+		name:        iface.Name(),
+		mtu:         cfg.MTU,
+		localIP:     cfg.LocalIP,
+		remoteIP:    cfg.RemoteIP,
+		subnet:      cfg.Subnet,
+		vpnServerIP: cfg.VPNServerIP,
 	}
 
 	// Configure the interface
@@ -135,6 +142,162 @@ func (d *TUNDevice) configureLinux() error {
 	return nil
 }
 
+// SetDefaultRoute redirects all traffic through the VPN
+func (d *TUNDevice) SetDefaultRoute() error {
+	switch runtime.GOOS {
+	case "darwin":
+		return d.setDefaultRouteDarwin()
+	case "linux":
+		return d.setDefaultRouteLinux()
+	default:
+		return fmt.Errorf("unsupported OS: %s", runtime.GOOS)
+	}
+}
+
+// setDefaultRouteDarwin sets default route on macOS
+func (d *TUNDevice) setDefaultRouteDarwin() error {
+	// Get current default gateway
+	gateway, err := getDefaultGateway()
+	if err != nil {
+		return fmt.Errorf("failed to get default gateway: %w", err)
+	}
+	d.originalGateway = gateway
+	fmt.Printf("Original gateway: %s\n", gateway)
+
+	// Add route to VPN server via original gateway (so VPN traffic can reach server)
+	if d.vpnServerIP != "" {
+		cmd := exec.Command("route", "add", "-host", d.vpnServerIP, gateway)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			fmt.Printf("Warning: route to VPN server: %s\n", string(out))
+		}
+	}
+
+	// Delete old default route
+	cmd := exec.Command("route", "delete", "default")
+	cmd.CombinedOutput() // Ignore error
+
+	// Add new default route via VPN
+	cmd = exec.Command("route", "add", "default", d.remoteIP.String())
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("failed to add default route: %s: %w", string(out), err)
+	}
+
+	fmt.Printf("Default route set to VPN: %s\n", d.remoteIP.String())
+	return nil
+}
+
+// setDefaultRouteLinux sets default route on Linux
+func (d *TUNDevice) setDefaultRouteLinux() error {
+	// Get current default gateway
+	gateway, err := getDefaultGateway()
+	if err != nil {
+		return fmt.Errorf("failed to get default gateway: %w", err)
+	}
+	d.originalGateway = gateway
+
+	// Add route to VPN server via original gateway
+	if d.vpnServerIP != "" {
+		cmd := exec.Command("ip", "route", "add", d.vpnServerIP, "via", gateway)
+		cmd.CombinedOutput() // Ignore error if exists
+	}
+
+	// Add default route via VPN with lower metric
+	cmd := exec.Command("ip", "route", "add", "default", "via", d.remoteIP.String(), "metric", "1")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("failed to add default route: %s: %w", string(out), err)
+	}
+
+	return nil
+}
+
+// RemoveDefaultRoute restores original routing
+func (d *TUNDevice) RemoveDefaultRoute() error {
+	switch runtime.GOOS {
+	case "darwin":
+		return d.removeDefaultRouteDarwin()
+	case "linux":
+		return d.removeDefaultRouteLinux()
+	default:
+		return nil
+	}
+}
+
+// removeDefaultRouteDarwin restores routes on macOS
+func (d *TUNDevice) removeDefaultRouteDarwin() error {
+	// Delete VPN default route
+	cmd := exec.Command("route", "delete", "default")
+	cmd.CombinedOutput()
+
+	// Restore original default route
+	if d.originalGateway != "" {
+		cmd = exec.Command("route", "add", "default", d.originalGateway)
+		cmd.CombinedOutput()
+	}
+
+	// Remove route to VPN server
+	if d.vpnServerIP != "" {
+		cmd = exec.Command("route", "delete", "-host", d.vpnServerIP)
+		cmd.CombinedOutput()
+	}
+
+	return nil
+}
+
+// removeDefaultRouteLinux restores routes on Linux
+func (d *TUNDevice) removeDefaultRouteLinux() error {
+	// Remove VPN default route
+	cmd := exec.Command("ip", "route", "del", "default", "via", d.remoteIP.String())
+	cmd.CombinedOutput()
+
+	// Remove route to VPN server
+	if d.vpnServerIP != "" {
+		cmd = exec.Command("ip", "route", "del", d.vpnServerIP)
+		cmd.CombinedOutput()
+	}
+
+	return nil
+}
+
+// getDefaultGateway gets the current default gateway
+func getDefaultGateway() (string, error) {
+	var cmd *exec.Cmd
+
+	switch runtime.GOOS {
+	case "darwin":
+		cmd = exec.Command("route", "-n", "get", "default")
+	case "linux":
+		cmd = exec.Command("ip", "route", "show", "default")
+	default:
+		return "", fmt.Errorf("unsupported OS")
+	}
+
+	out, err := cmd.Output()
+	if err != nil {
+		return "", err
+	}
+
+	lines := strings.Split(string(out), "\n")
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if runtime.GOOS == "darwin" && strings.HasPrefix(line, "gateway:") {
+			parts := strings.Fields(line)
+			if len(parts) >= 2 {
+				return parts[1], nil
+			}
+		}
+		if runtime.GOOS == "linux" && strings.HasPrefix(line, "default") {
+			parts := strings.Fields(line)
+			for i, p := range parts {
+				if p == "via" && i+1 < len(parts) {
+					return parts[i+1], nil
+				}
+			}
+		}
+	}
+
+	return "", fmt.Errorf("gateway not found")
+}
+
 // Read reads a packet from the TUN device
 func (d *TUNDevice) Read(b []byte) (int, error) {
 	return d.iface.Read(b)
@@ -147,6 +310,8 @@ func (d *TUNDevice) Write(b []byte) (int, error) {
 
 // Close closes the TUN device
 func (d *TUNDevice) Close() error {
+	// Restore routes before closing
+	d.RemoveDefaultRoute()
 	return d.iface.Close()
 }
 

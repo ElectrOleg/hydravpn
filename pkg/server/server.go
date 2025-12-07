@@ -261,8 +261,9 @@ func (s *Server) handleConnection(conn transport.Connection) {
 		return
 	}
 	
-	// Derive session keys
-	salt, _ := crypto.GenerateRandomBytes(32)
+	// Derive session keys using deterministic salt from shared secret
+	// Both client and server will derive the same salt
+	salt := sharedSecret[:] // Use shared secret as salt (it's already shared)
 	cryptoSession, err := crypto.DeriveSessionKeys(sharedSecret, false, salt)
 	if err != nil {
 		log.Printf("Derive keys error: %v", err)
