@@ -1,0 +1,22 @@
+# Dependencies
+go.sum
+
+# Binary
+hydra
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+logs/
+*.log
+
+# Git
+.git/
+.gitignore
