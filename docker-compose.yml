@@ -16,9 +16,8 @@ services:
     # Host networking for proper NAT (traffic routing)
     network_mode: host
 
-    # Sysctls (backup, also set in entrypoint)
-    sysctls:
-      - net.ipv4.ip_forward=1
+    # Note: ip_forward is set in docker-entrypoint.sh
+    # sysctls not allowed with network_mode: host
 
     # Health check
     healthcheck:
