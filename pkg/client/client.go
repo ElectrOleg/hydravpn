@@ -150,6 +150,11 @@ func (c *Client) Connect() error {
 			log.Printf("All traffic now routes through VPN")
 		}
 
+		// Configure DNS to use public DNS servers
+		if err := tunDev.SetDNS(); err != nil {
+			log.Printf("Warning: Failed to set DNS: %v", err)
+		}
+
 		// Start reading from TUN
 		c.wg.Add(1)
 		go c.tunReadLoop()

@@ -22,6 +22,10 @@ type TUNDevice struct {
 	// For route cleanup
 	originalGateway string
 	vpnServerIP     string
+	
+	// For DNS cleanup
+	originalDNS     string
+	networkService  string // e.g., "Wi-Fi" on macOS
 }
 
 // Config holds TUN device configuration
@@ -310,6 +314,8 @@ func (d *TUNDevice) Write(b []byte) (int, error) {
 
 // Close closes the TUN device
 func (d *TUNDevice) Close() error {
+	// Restore DNS before closing
+	d.RestoreDNS()
 	// Restore routes before closing
 	d.RemoveDefaultRoute()
 	return d.iface.Close()
@@ -328,4 +334,148 @@ func (d *TUNDevice) MTU() int {
 // LocalIP returns the local IP
 func (d *TUNDevice) LocalIP() net.IP {
 	return d.localIP
+}
+
+// SetDNS configures DNS to use public DNS servers
+func (d *TUNDevice) SetDNS() error {
+	switch runtime.GOOS {
+	case "darwin":
+		return d.setDNSDarwin()
+	case "linux":
+		return d.setDNSLinux()
+	default:
+		return nil
+	}
+}
+
+// setDNSDarwin sets DNS on macOS
+func (d *TUNDevice) setDNSDarwin() error {
+	// Find the active network service
+	service, err := getActiveNetworkService()
+	if err != nil {
+		return fmt.Errorf("failed to get network service: %w", err)
+	}
+	d.networkService = service
+
+	// Get current DNS servers
+	cmd := exec.Command("networksetup", "-getdnsservers", service)
+	out, _ := cmd.Output()
+	d.originalDNS = strings.TrimSpace(string(out))
+	fmt.Printf("Original DNS: %s\n", d.originalDNS)
+
+	// Set public DNS servers (Cloudflare + Google)
+	cmd = exec.Command("networksetup", "-setdnsservers", service, "1.1.1.1", "8.8.8.8")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("failed to set DNS: %s: %w", string(out), err)
+	}
+
+	fmt.Println("DNS set to: 1.1.1.1, 8.8.8.8")
+	return nil
+}
+
+// setDNSLinux sets DNS on Linux
+func (d *TUNDevice) setDNSLinux() error {
+	// On Linux, modify /etc/resolv.conf or use resolvectl
+	// For simplicity, we'll use resolvectl if available
+	cmd := exec.Command("which", "resolvectl")
+	if err := cmd.Run(); err == nil {
+		// Use systemd-resolved
+		cmd = exec.Command("resolvectl", "dns", d.name, "1.1.1.1", "8.8.8.8")
+		cmd.CombinedOutput()
+	}
+	return nil
+}
+
+// RestoreDNS restores original DNS settings
+func (d *TUNDevice) RestoreDNS() error {
+	switch runtime.GOOS {
+	case "darwin":
+		return d.restoreDNSDarwin()
+	case "linux":
+		return d.restoreDNSLinux()
+	default:
+		return nil
+	}
+}
+
+// restoreDNSDarwin restores DNS on macOS
+func (d *TUNDevice) restoreDNSDarwin() error {
+	if d.networkService == "" {
+		return nil
+	}
+
+	var cmd *exec.Cmd
+	if d.originalDNS == "" || strings.Contains(d.originalDNS, "There aren't any DNS Servers") {
+		// Set to empty (use DHCP)
+		cmd = exec.Command("networksetup", "-setdnsservers", d.networkService, "Empty")
+	} else {
+		// Restore original
+		dnsServers := strings.Fields(d.originalDNS)
+		args := append([]string{"-setdnsservers", d.networkService}, dnsServers...)
+		cmd = exec.Command("networksetup", args...)
+	}
+
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("failed to restore DNS: %s: %w", string(out), err)
+	}
+
+	fmt.Println("DNS restored")
+	return nil
+}
+
+// restoreDNSLinux restores DNS on Linux
+func (d *TUNDevice) restoreDNSLinux() error {
+	// systemd-resolved will automatically restore when interface goes down
+	return nil
+}
+
+// getActiveNetworkService finds the active network service on macOS
+func getActiveNetworkService() (string, error) {
+	// Get the primary network service
+	cmd := exec.Command("route", "-n", "get", "default")
+	out, err := cmd.Output()
+	if err != nil {
+		return "Wi-Fi", nil // Default to Wi-Fi
+	}
+
+	// Find interface name
+	var iface string
+	lines := strings.Split(string(out), "\n")
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "interface:") {
+			parts := strings.Fields(line)
+			if len(parts) >= 2 {
+				iface = parts[1]
+				break
+			}
+		}
+	}
+
+	if iface == "" {
+		return "Wi-Fi", nil
+	}
+
+	// Map interface to service name
+	cmd = exec.Command("networksetup", "-listallhardwareports")
+	out, err = cmd.Output()
+	if err != nil {
+		return "Wi-Fi", nil
+	}
+
+	lines = strings.Split(string(out), "\n")
+	var currentService string
+	for _, line := range lines {
+		if strings.HasPrefix(line, "Hardware Port:") {
+			currentService = strings.TrimPrefix(line, "Hardware Port: ")
+		}
+		if strings.HasPrefix(line, "Device:") {
+			device := strings.TrimSpace(strings.TrimPrefix(line, "Device:"))
+			if device == iface {
+				return currentService, nil
+			}
+		}
+	}
+
+	return "Wi-Fi", nil
 }
