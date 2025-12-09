@@ -103,34 +103,44 @@ func runServer() {
 
 func runClient() {
 	fmt.Print(banner)
-	
+
 	clientFlags := flag.NewFlagSet("client", flag.ExitOnError)
 	serverAddr := clientFlags.String("server", "127.0.0.1:8443", "Server address")
 	transportType := clientFlags.String("transport", "websocket", "Transport type")
-	
+
 	clientFlags.Parse(os.Args[2:])
-	
+
 	cfg := client.DefaultConfig()
 	cfg.ServerAddr = *serverAddr
 	cfg.TransportType = parseTransport(*transportType)
-	
+	cfg.AutoReconnect = false // Disable auto-reconnect on manual disconnect
+
 	cli, err := client.New(cfg)
 	if err != nil {
 		log.Fatalf("Failed to create client: %v", err)
 	}
-	
+
+	// Ensure cleanup happens even on panic
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("Panic recovered: %v", r)
+		}
+		log.Println("Cleaning up...")
+		cli.Disconnect()
+	}()
+
 	if err := cli.Connect(); err != nil {
 		log.Fatalf("Failed to connect: %v", err)
 	}
-	
+
 	// Wait for interrupt
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
-	
+
 	log.Println("Connected. Press Ctrl+C to disconnect.")
 	<-sigChan
-	
-	cli.Disconnect()
+
+	// Disconnect is called in defer
 }
 
 func parseTransport(t string) transport.TransportType {
